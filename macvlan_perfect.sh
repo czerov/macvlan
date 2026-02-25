@@ -1,10 +1,10 @@
 #!/bin/bash
 # =================================================================
-# Docker Macvlan 完美一键配置脚本 (智能双栈 + 幂等防错版)
+# Docker Macvlan 完美一键配置脚本 (智能双栈 + fe80免疫版)
 # 1. 修复了原版 subnet 识别错误的 BUG
-# 2. 增加了多本地 IPv6 检测，强制校验 CIDR 格式防止 Docker 报错
+# 2. 增加了本地 IPv6 检测，强制校验 CIDR 格式防止 Docker 报错
 # 3. 智能匹配网卡：通过网关顺藤摸瓜寻找对应网卡
-# 4. 服务幂等性：解决重复运行脚本导致 Systemd 报错的问题
+# 4. 免疫 Docker Bug：自动绕过 fe80 网关验证，防报错
 # =================================================================
 
 # 颜色设置
@@ -60,19 +60,24 @@ echo -e "  - IPv4 子网(Subnet): ${GREEN}${REAL_SUBNET}${NC}"
 echo -e "  - IPv4 网关(Gateway): ${GREEN}${GATEWAY}${NC}"
 echo -e "  - IPv4 前缀:         ${GREEN}${IP_PREFIX}.x${NC}"
 
-# --- IPv6 检测 (增加 CIDR 严格过滤) ---
+# --- IPv6 检测 (增加 Docker fe80 Bug 免疫) ---
 echo "--------------------------------------------------------"
 echo "正在检测 IPv6 环境..."
-# 提取非 fe80 的真实 IPv6 网段，强制要求包含 '/' 以确保是 CIDR 格式
 IPV6_SUBNET=$(ip -6 route show dev $IFACE | grep -v default | grep -vwE '^fe80' | grep '/' | awk '{print $1}' | head -n 1)
 
 if [ -n "$IPV6_SUBNET" ]; then
     echo -e "  - 检测到 IPv6 网段 (CIDR): ${GREEN}${IPV6_SUBNET}${NC}"
     IPV6_GATEWAY=$(ip -6 route show default | grep $IFACE | awk '{print $3}' | head -n 1)
-    if [ -n "$IPV6_GATEWAY" ]; then
+    
+    # 核心修复：绕过 Docker 针对 fe80 网关的弱智校验
+    if [[ "$IPV6_GATEWAY" == fe80* ]]; then
+        echo -e "  - 检测到 IPv6 网关: ${YELLOW}${IPV6_GATEWAY}${NC} (本地链路地址)"
+        echo -e "  - ${CYAN}提示: Docker 对 fe80 存在验证 Bug，将跳过网关绑定，交由 SLAAC 自动分配路由${NC}"
+        IPV6_GATEWAY="" 
+    elif [ -n "$IPV6_GATEWAY" ]; then
         echo -e "  - 检测到 IPv6 网关: ${GREEN}${IPV6_GATEWAY}${NC}"
     else
-        echo -e "  - ${YELLOW}未检测到默认 IPv6 网关，Docker 网络将依赖 SLAAC 自动路由${NC}"
+        echo -e "  - ${YELLOW}未检测到默认 IPv6 网关，交由 SLAAC 自动路由${NC}"
     fi
     ENABLE_IPV6=true
 else
@@ -109,7 +114,6 @@ echo "正在配置 Shim 接口实现宿主机与 Macvlan 容器互通..."
 
 ip link del shim >/dev/null 2>&1
 
-# 核心优化：在 ExecStart 前加 '-'，忽略已存在导致的报错
 cat > /etc/systemd/system/macvlan-shim.service <<EOF
 [Unit]
 Description=Macvlan Shim Service for Host-to-Container Communication
@@ -124,6 +128,7 @@ ExecStart=-/sbin/ip addr add ${SHIM_IP}/32 dev shim
 ExecStart=-/sbin/ip link set shim up
 EOF
 
+# 清空之前的路由残留（幂等性保护）
 for i in $(seq $START_IP_SUFFIX $END_IP_SUFFIX); do
     echo "ExecStart=-/sbin/ip route add ${IP_PREFIX}.$i dev shim" >> /etc/systemd/system/macvlan-shim.service
 done
