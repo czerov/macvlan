@@ -1,8 +1,9 @@
 #!/bin/bash
 # =================================================================
-# Docker Macvlan 完美一键配置脚本 (fnOS/Debian 终极双栈版)
+# Docker Macvlan 完美一键配置脚本 (智能网卡匹配+终极双栈版)
 # 1. 修复了原版 subnet 识别错误的 BUG
 # 2. 增加了本地 IPv6 检测，支持创建 IPv4/IPv6 双栈 Macvlan
+# 3. 创新优化：通过输入网关 IP，自动智能推断物理网卡名称
 # =================================================================
 
 # 颜色设置
@@ -13,22 +14,37 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 echo -e "${CYAN}#########################################${NC}"
-echo -e "${CYAN}#  Docker Macvlan 终极双栈修复版脚本    #${NC}"
+echo -e "${CYAN}#  Docker Macvlan 智能双栈修复版脚本    #${NC}"
 echo -e "${CYAN}#########################################${NC}"
 echo ""
 
-# [1/5] 选择物理网卡
-echo -e "${YELLOW}[1/5] 选择物理网卡...${NC}"
+# [1/5] 智能匹配网关与物理网卡
+echo -e "${YELLOW}[1/5] 智能匹配网关与物理网卡...${NC}"
 echo "--------------------------------------------------------"
-echo "系统检测到以下物理网卡："
-INTERFACES=$(ls /sys/class/net | grep -v 'lo\|docker\|veth\|br-\|shim')
-echo -e "${GREEN}${INTERFACES}${NC}"
-echo ""
-read -p "请输入你要使用的物理网卡名称 (例如 enp3s0 或 eth0): " IFACE
-if [[ -z "$IFACE" || ! -d "/sys/class/net/$IFACE" ]]; then
-    echo -e "${RED}错误: 填写的网卡不存在！${NC}"
+# 尝试自动获取系统的默认 IPv4 网关作为推荐值
+DEFAULT_GW=$(ip -4 route show default | awk '{print $3}' | head -n 1)
+
+read -p "请输入你家路由器的网关 IP (例如 192.168.6.1) [默认: ${DEFAULT_GW}]: " INPUT_GW
+INPUT_GW=${INPUT_GW:-$DEFAULT_GW}
+
+if [[ -z "$INPUT_GW" ]]; then
+    echo -e "${RED}错误: 网关 IP 不能为空！${NC}"
     exit 1
 fi
+
+echo "正在通过网关 IP ($INPUT_GW) 顺藤摸瓜寻找对应网卡..."
+# 核心优化：利用 ip route get 精准反查网卡名称
+IFACE=$(ip route get "$INPUT_GW" | grep dev | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+
+if [[ -z "$IFACE" || ! -d "/sys/class/net/$IFACE" ]]; then
+    echo -e "${RED}错误: 无法根据网关 $INPUT_GW 找到对应的物理网卡，请检查 IP 是否正确！${NC}"
+    exit 1
+fi
+
+echo -e "  - 成功匹配到物理网卡: ${GREEN}${IFACE}${NC}"
+# 将用户确认的网关存入变量，供后续 Docker 组网使用
+GATEWAY=$INPUT_GW
+
 
 # [2/5] 分析网络环境 (包含 IPv4 与 IPv6)
 echo ""
@@ -42,15 +58,9 @@ if [ -z "$REAL_SUBNET" ]; then
     exit 1
 fi
 
-GATEWAY=$(ip -4 route show default | grep $IFACE | awk '{print $3}' | head -n 1)
-if [ -z "$GATEWAY" ]; then
-    IP_PREFIX=$(echo $REAL_SUBNET | cut -d'.' -f1-3)
-    GATEWAY="${IP_PREFIX}.1"
-else
-    IP_PREFIX=$(echo $REAL_SUBNET | cut -d'.' -f1-3)
-fi
+IP_PREFIX=$(echo $REAL_SUBNET | cut -d'.' -f1-3)
 
-echo -e "  - IPv4 子网(Subnet): ${GREEN}${REAL_SUBNET}${NC} (已修复BUG)"
+echo -e "  - IPv4 子网(Subnet): ${GREEN}${REAL_SUBNET}${NC}"
 echo -e "  - IPv4 网关(Gateway): ${GREEN}${GATEWAY}${NC}"
 echo -e "  - IPv4 前缀:         ${GREEN}${IP_PREFIX}.x${NC}"
 
