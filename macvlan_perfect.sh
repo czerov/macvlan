@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================
-# Docker Macvlan 完美一键配置脚本 (智能双栈 + fe80免疫版)
+# Docker Macvlan 配置脚本 (智能双栈 + 宿主机互通 + TTL兼容)
 # =================================================================
 
 # 颜色设置
@@ -10,13 +10,18 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误: 请使用 root 用户运行此脚本。${NC}"
+    exit 1
+fi
+
 echo -e "${CYAN}#########################################${NC}"
 echo -e "${CYAN}#  Docker Macvlan 智能双栈终极修复版    #${NC}"
 echo -e "${CYAN}#########################################${NC}"
 echo ""
 
-# [1/5] 智能匹配网关与物理网卡
-echo -e "${YELLOW}[1/5] 智能匹配网关与物理网卡...${NC}"
+# [1/6] 智能匹配网关与物理网卡
+echo -e "${YELLOW}[1/6] 智能匹配网关与物理网卡...${NC}"
 echo "--------------------------------------------------------"
 DEFAULT_GW=$(ip -4 route show default | awk '{print $3}' | head -n 1)
 
@@ -39,9 +44,9 @@ fi
 echo -e "  - 成功匹配到物理网卡: ${GREEN}${IFACE}${NC}"
 GATEWAY=$INPUT_GW
 
-# [2/5] 分析网络环境 (包含 IPv4 与 IPv6)
+# [2/6] 分析网络环境 (包含 IPv4 与 IPv6)
 echo ""
-echo -e "${YELLOW}[2/5] 分析网络环境...${NC}"
+echo -e "${YELLOW}[2/6] 分析网络环境...${NC}"
 echo "--------------------------------------------------------"
 
 REAL_SUBNET=$(ip -4 route show dev $IFACE | grep -v default | awk '{print $1}' | head -n 1)
@@ -78,9 +83,9 @@ else
     ENABLE_IPV6=false
 fi
 
-# [3/5] 配置 Macvlan IP 范围
+# [3/6] 配置 Macvlan IP 范围
 echo ""
-echo -e "${YELLOW}[3/5] 配置 Macvlan IPv4 范围...${NC}"
+echo -e "${YELLOW}[3/6] 配置 Macvlan IPv4 范围...${NC}"
 echo "--------------------------------------------------------"
 read -p "请输入宿主机通信专用 IP (最后一位数字) [推荐: 220]: " SHIM_IP_SUFFIX
 SHIM_IP_SUFFIX=${SHIM_IP_SUFFIX:-220}
@@ -100,15 +105,16 @@ echo -e "将在宿主机添加路由: ${GREEN}${START_IP} -> ${END_IP}${NC}"
 echo -e "宿主机通信 IP (Shim): ${GREEN}${SHIM_IP}${NC}"
 echo "--------------------------------------------------------"
 
-# [4/5] 部署系统服务 (增加幂等性)
+# [4/6] 部署系统服务 (增加幂等性)
 echo ""
-echo -e "${YELLOW}[4/5] 部署宿主机互通服务...${NC}"
+echo -e "${YELLOW}[4/6] 部署宿主机互通服务...${NC}"
 ip link del shim >/dev/null 2>&1
 
 cat > /etc/systemd/system/macvlan-shim.service <<EOF
 [Unit]
 Description=Macvlan Shim Service for Host-to-Container Communication
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=oneshot
@@ -123,6 +129,12 @@ for i in $(seq $START_IP_SUFFIX $END_IP_SUFFIX); do
     echo "ExecStart=-/sbin/ip route add ${IP_PREFIX}.$i dev shim" >> /etc/systemd/system/macvlan-shim.service
 done
 
+cat >> /etc/systemd/system/macvlan-shim.service <<EOF
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable macvlan-shim.service >/dev/null 2>&1
 systemctl restart macvlan-shim.service
@@ -133,9 +145,9 @@ else
     echo -e "${RED}x Shim 接口未发现，请检查系统日志。${NC}"
 fi
 
-# [5/5] Docker 网络设置
+# [5/6] Docker 网络设置
 echo ""
-echo -e "${YELLOW}[5/5] Docker 网络设置...${NC}"
+echo -e "${YELLOW}[5/6] Docker 网络设置...${NC}"
 read -p "是否自动创建 Docker 网络？(y/n) [默认: y]: " CREATE_DOCKER
 CREATE_DOCKER=${CREATE_DOCKER:-y}
 
@@ -165,6 +177,80 @@ if [[ "$CREATE_DOCKER" == "y" || "$CREATE_DOCKER" == "Y" ]]; then
     else
         echo -e "${RED}x Docker 网络创建失败！${NC}"
     fi
+fi
+
+# [6/6] 可选修复：上游将公网回包 TTL 设置为 1 时，Docker bridge 无法转发
+echo ""
+echo -e "${YELLOW}[6/6] 检测 Docker bridge 的 TTL=1 兼容需求...${NC}"
+echo "--------------------------------------------------------"
+
+IPTABLES_BIN=$(command -v iptables 2>/dev/null)
+TTL_FIX_RECOMMENDED=false
+TTL_FIX_REASON=""
+PUBLIC_REPLY_TTL=""
+
+if [ -n "$IPTABLES_BIN" ]; then
+    TTL_RULE_ARGS=(-i "$IFACE" -m conntrack --ctstate ESTABLISHED,RELATED -m ttl --ttl-eq 1 -j TTL --ttl-inc 1)
+
+    if "$IPTABLES_BIN" -t mangle -C PREROUTING "${TTL_RULE_ARGS[@]}" >/dev/null 2>&1; then
+        TTL_FIX_RECOMMENDED=true
+        TTL_FIX_REASON="检测到当前系统已有相同的临时 TTL 修复规则"
+    elif command -v ping >/dev/null 2>&1; then
+        PUBLIC_REPLY_TTL=$(ping -4 -c 1 -W 2 223.5.5.5 2>/dev/null | sed -nE 's/.*[Tt][Tt][Ll]=([0-9]+).*/\1/p' | head -n 1)
+        if [ "$PUBLIC_REPLY_TTL" = "1" ]; then
+            TTL_FIX_RECOMMENDED=true
+            TTL_FIX_REASON="检测到公网 IPv4 回包 TTL=1；该回包经过 bridge 转发时会降为 0 并被内核丢弃"
+        fi
+    fi
+fi
+
+if [ "$TTL_FIX_RECOMMENDED" = true ]; then
+    echo -e "  - ${RED}${TTL_FIX_REASON}${NC}"
+    read -p "是否安装持久化 Docker bridge TTL 兼容服务？(y/n) [默认: y]: " INSTALL_TTL_FIX
+    INSTALL_TTL_FIX=${INSTALL_TTL_FIX:-y}
+else
+    if [ -n "$PUBLIC_REPLY_TTL" ]; then
+        echo -e "  - 当前检测到的公网回包 TTL: ${GREEN}${PUBLIC_REPLY_TTL}${NC}"
+    else
+        echo -e "  - ${YELLOW}未能确认公网回包 TTL，不会默认修改防火墙。${NC}"
+    fi
+    read -p "是否仍要安装 Docker bridge TTL 兼容服务？(y/n) [默认: n]: " INSTALL_TTL_FIX
+    INSTALL_TTL_FIX=${INSTALL_TTL_FIX:-n}
+fi
+
+if [[ "$INSTALL_TTL_FIX" == "y" || "$INSTALL_TTL_FIX" == "Y" ]]; then
+    if [ -z "$IPTABLES_BIN" ]; then
+        echo -e "${RED}x 未找到 iptables，无法安装 TTL 兼容服务。${NC}"
+    elif ! "$IPTABLES_BIN" -t mangle -j TTL -h >/dev/null 2>&1; then
+        echo -e "${RED}x 当前内核或 iptables 不支持 TTL target，未修改防火墙。${NC}"
+    else
+        cat > /etc/systemd/system/docker-bridge-ttl.service <<EOF
+[Unit]
+Description=Docker Bridge TTL=1 Compatibility Service
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '${IPTABLES_BIN} -t mangle -C PREROUTING -i ${IFACE} -m conntrack --ctstate ESTABLISHED,RELATED -m ttl --ttl-eq 1 -j TTL --ttl-inc 1 >/dev/null 2>&1 || ${IPTABLES_BIN} -t mangle -I PREROUTING 1 -i ${IFACE} -m conntrack --ctstate ESTABLISHED,RELATED -m ttl --ttl-eq 1 -j TTL --ttl-inc 1'
+ExecStop=/bin/sh -c '${IPTABLES_BIN} -t mangle -C PREROUTING -i ${IFACE} -m conntrack --ctstate ESTABLISHED,RELATED -m ttl --ttl-eq 1 -j TTL --ttl-inc 1 >/dev/null 2>&1 && ${IPTABLES_BIN} -t mangle -D PREROUTING -i ${IFACE} -m conntrack --ctstate ESTABLISHED,RELATED -m ttl --ttl-eq 1 -j TTL --ttl-inc 1 || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        if systemctl enable docker-bridge-ttl.service >/dev/null 2>&1 && \
+           systemctl restart docker-bridge-ttl.service && \
+           "$IPTABLES_BIN" -t mangle -C PREROUTING "${TTL_RULE_ARGS[@]}" >/dev/null 2>&1; then
+            echo -e "${GREEN}√ Docker bridge TTL 兼容服务已安装并生效。${NC}"
+        else
+            echo -e "${RED}x TTL 兼容服务启动失败，请运行 systemctl status docker-bridge-ttl.service 查看日志。${NC}"
+        fi
+    fi
+else
+    echo -e "  - ${CYAN}未安装 TTL 兼容服务，现有防火墙规则保持不变。${NC}"
 fi
 
 # =================================================================
