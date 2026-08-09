@@ -13,3 +13,16 @@ Docker 默认路由或清空防火墙规则。
 
 注意：上面的远程安装命令读取 GitHub 仓库中的脚本。只有将本地修改重新发布到
 `czerov/macvlan` 后，远程命令才会包含本次修复。
+
+## 还原网络并删除 macvlan
+
+```bash
+bash <(wget -qO- https://ghproxy.net/https://raw.githubusercontent.com/czerov/macvlan/main/macvlan_perfect.sh) --restore
+```
+
+还原模式会先检查名为 `macvlan` 的 Docker 网络是否仍连接容器。存在连接时会显示容器
+并停止操作，不会强制断开或删除容器。确认后只删除空闲的 `macvlan` 网络、`shim` 接口、
+关联路由和 `/etc/systemd/system/macvlan-shim.service`。
+
+TTL 兼容服务与 macvlan 相互独立，默认保留，避免 Docker `bridge` 容器恢复后再次断网。
+脚本检测到该服务时会单独询问是否删除。

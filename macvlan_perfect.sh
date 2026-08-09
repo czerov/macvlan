@@ -10,10 +10,176 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-if [ "$(id -u)" -ne 0 ]; then
+if [ "$(id -u)" -ne 0 ] && [[ "${1:-}" != "-h" && "${1:-}" != "--help" ]]; then
     echo -e "${RED}错误: 请使用 root 用户运行此脚本。${NC}"
     exit 1
 fi
+
+show_usage() {
+    echo "用法:"
+    echo "  bash macvlan_perfect.sh              安装或更新 macvlan 配置"
+    echo "  bash macvlan_perfect.sh --restore    还原宿主机网络并删除 macvlan"
+    echo "  bash macvlan_perfect.sh --uninstall  与 --restore 相同"
+}
+
+restore_macvlan_network() {
+    echo -e "${CYAN}===============================================${NC}"
+    echo -e "${YELLOW}还原宿主机网络并删除 Docker macvlan${NC}"
+    echo -e "${CYAN}===============================================${NC}"
+
+    for required_command in ip docker systemctl; do
+        if ! command -v "$required_command" >/dev/null 2>&1; then
+            echo -e "${RED}错误: 未找到 ${required_command}，未执行任何还原操作。${NC}"
+            return 1
+        fi
+    done
+
+    NETWORK_EXISTS=false
+    ATTACHED_COUNT=0
+    if docker network inspect macvlan >/dev/null 2>&1; then
+        NETWORK_EXISTS=true
+        ATTACHED_COUNT=$(docker network inspect macvlan --format '{{len .Containers}}' 2>/dev/null)
+        if ! [[ "$ATTACHED_COUNT" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}错误: 无法确认 macvlan 网络的容器占用情况，未执行任何还原操作。${NC}"
+            return 1
+        fi
+
+        if [ "$ATTACHED_COUNT" -gt 0 ]; then
+            echo -e "${RED}错误: macvlan 网络仍连接 ${ATTACHED_COUNT} 个容器。${NC}"
+            docker network inspect macvlan \
+                --format '{{range .Containers}}  - {{.Name}} ({{.IPv4Address}}){{println}}{{end}}'
+            echo -e "${YELLOW}请先手动停止或迁移这些容器，然后重新执行 --restore。${NC}"
+            return 1
+        fi
+    fi
+
+    RESTORE_IFACE=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    RESTORE_IPTABLES=$(command -v iptables 2>/dev/null)
+    TTL_FIX_PRESENT=false
+
+    if [ -f /etc/systemd/system/docker-bridge-ttl.service ] || \
+       systemctl is-enabled docker-bridge-ttl.service >/dev/null 2>&1; then
+        TTL_FIX_PRESENT=true
+    elif [ -n "$RESTORE_IFACE" ] && [ -n "$RESTORE_IPTABLES" ] && \
+         "$RESTORE_IPTABLES" -t mangle -C PREROUTING -i "$RESTORE_IFACE" \
+             -m conntrack --ctstate ESTABLISHED,RELATED \
+             -m ttl --ttl-eq 1 -j TTL --ttl-inc 1 >/dev/null 2>&1; then
+        TTL_FIX_PRESENT=true
+    fi
+
+    echo ""
+    echo "将执行以下操作："
+    if [ "$NETWORK_EXISTS" = true ]; then
+        echo "  - 删除空闲的 Docker 网络: macvlan"
+    else
+        echo "  - Docker 网络 macvlan 不存在，跳过"
+    fi
+    echo "  - 停止并禁用 macvlan-shim.service"
+    echo "  - 删除 shim 接口及其关联路由"
+    echo "  - 删除 /etc/systemd/system/macvlan-shim.service"
+    echo "  - 不删除任何容器、镜像、卷或业务数据"
+    echo ""
+
+    read -r -p "请输入 RESTORE 确认还原，其他输入将取消: " RESTORE_CONFIRM
+    if [ "$RESTORE_CONFIRM" != "RESTORE" ]; then
+        echo -e "${YELLOW}已取消，未修改系统。${NC}"
+        return 0
+    fi
+
+    REMOVE_TTL_FIX=n
+    if [ "$TTL_FIX_PRESENT" = true ]; then
+        echo -e "${YELLOW}检测到 Docker bridge TTL 兼容服务或规则。删除它可能导致 bridge 容器再次无法联网。${NC}"
+        read -r -p "是否同时删除 TTL 兼容服务？(y/n) [默认: n]: " REMOVE_TTL_FIX
+        REMOVE_TTL_FIX=${REMOVE_TTL_FIX:-n}
+    fi
+
+    if [ "$NETWORK_EXISTS" = true ]; then
+        if ! docker network rm macvlan; then
+            echo -e "${RED}错误: Docker 网络 macvlan 删除失败，未继续修改宿主机配置。${NC}"
+            return 1
+        fi
+    fi
+
+    systemctl stop macvlan-shim.service >/dev/null 2>&1 || true
+    systemctl disable macvlan-shim.service >/dev/null 2>&1 || true
+
+    if ip link show shim >/dev/null 2>&1; then
+        if ! ip link del shim; then
+            echo -e "${RED}错误: shim 接口删除失败，请检查系统日志。${NC}"
+            return 1
+        fi
+    fi
+
+    if [ -f /etc/systemd/system/macvlan-shim.service ]; then
+        rm -f -- /etc/systemd/system/macvlan-shim.service
+    fi
+
+    if [[ "$REMOVE_TTL_FIX" == "y" || "$REMOVE_TTL_FIX" == "Y" ]]; then
+        systemctl stop docker-bridge-ttl.service >/dev/null 2>&1 || true
+        systemctl disable docker-bridge-ttl.service >/dev/null 2>&1 || true
+
+        if [ -n "$RESTORE_IFACE" ] && [ -n "$RESTORE_IPTABLES" ] && \
+           "$RESTORE_IPTABLES" -t mangle -C PREROUTING -i "$RESTORE_IFACE" \
+               -m conntrack --ctstate ESTABLISHED,RELATED \
+               -m ttl --ttl-eq 1 -j TTL --ttl-inc 1 >/dev/null 2>&1; then
+            "$RESTORE_IPTABLES" -t mangle -D PREROUTING -i "$RESTORE_IFACE" \
+                -m conntrack --ctstate ESTABLISHED,RELATED \
+                -m ttl --ttl-eq 1 -j TTL --ttl-inc 1
+        fi
+
+        if [ -f /etc/systemd/system/docker-bridge-ttl.service ]; then
+            rm -f -- /etc/systemd/system/docker-bridge-ttl.service
+        fi
+    fi
+
+    systemctl daemon-reload
+    systemctl reset-failed macvlan-shim.service >/dev/null 2>&1 || true
+    if [[ "$REMOVE_TTL_FIX" == "y" || "$REMOVE_TTL_FIX" == "Y" ]]; then
+        systemctl reset-failed docker-bridge-ttl.service >/dev/null 2>&1 || true
+    fi
+
+    RESTORE_FAILED=false
+    if docker network inspect macvlan >/dev/null 2>&1; then
+        echo -e "${RED}x Docker 网络 macvlan 仍然存在。${NC}"
+        RESTORE_FAILED=true
+    fi
+    if ip link show shim >/dev/null 2>&1; then
+        echo -e "${RED}x shim 接口仍然存在。${NC}"
+        RESTORE_FAILED=true
+    fi
+    if [ -f /etc/systemd/system/macvlan-shim.service ]; then
+        echo -e "${RED}x macvlan-shim.service 文件仍然存在。${NC}"
+        RESTORE_FAILED=true
+    fi
+
+    if [ "$RESTORE_FAILED" = true ]; then
+        echo -e "${RED}还原未完全成功，请根据以上提示检查。${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}√ macvlan 网络、shim 接口和宿主机路由已还原。${NC}"
+    if [ "$TTL_FIX_PRESENT" = true ] && [[ "$REMOVE_TTL_FIX" != "y" && "$REMOVE_TTL_FIX" != "Y" ]]; then
+        echo -e "${CYAN}TTL 兼容服务已保留，以维持 Docker bridge 容器联网。${NC}"
+    fi
+}
+
+case "${1:-}" in
+    --restore|--uninstall)
+        restore_macvlan_network
+        exit $?
+        ;;
+    -h|--help)
+        show_usage
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        echo -e "${RED}错误: 未知参数 $1${NC}"
+        show_usage
+        exit 1
+        ;;
+esac
 
 echo -e "${CYAN}#########################################${NC}"
 echo -e "${CYAN}#  Docker Macvlan 智能双栈终极修复版    #${NC}"
