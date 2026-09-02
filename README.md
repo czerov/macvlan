@@ -1,6 +1,6 @@
 # macvlan
 macvlan生成
-bash <(wget -qO- https://ghproxy.net/https://raw.githubusercontent.com/czerov/macvlan/main/macvlan_perfect.sh)
+bash <(wget -qO- https://gh-proxy.com/https://raw.githubusercontent.com/czerov/macvlan/main/macvlan_perfect.sh)
 
 ## TTL=1 兼容修复
 
@@ -17,7 +17,7 @@ Docker 默认路由或清空防火墙规则。
 ## 还原网络并删除 macvlan
 
 ```bash
-bash <(wget -qO- https://ghproxy.net/https://raw.githubusercontent.com/czerov/macvlan/main/macvlan_perfect.sh) --restore
+bash <(wget -qO- https://gh-proxy.com/https://raw.githubusercontent.com/czerov/macvlan/main/macvlan_perfect.sh) --restore
 ```
 
 还原模式会先检查名为 `macvlan` 的 Docker 网络是否仍连接容器。存在连接时会显示容器
